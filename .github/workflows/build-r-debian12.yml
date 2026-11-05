@@ -1,0 +1,182 @@
+name: Build Posit-style R for Debian 12
+
+on:
+  workflow_dispatch:
+    inputs:
+      r_version:
+        description: R release version (e.g. 4.6.2)
+        required: true
+        type: string
+        default: '4.6.2'
+      posit_ref:
+        description: rstudio/r-builds commit SHA, tag, or branch
+        required: true
+        type: string
+        default: 'main'
+      publish_release:
+        description: Publish GitHub Release after successful build and test
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: r-debian12-${{ inputs.r_version }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Debian 12 / amd64 / R ${{ inputs.r_version }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      R_VERSION: ${{ inputs.r_version }}
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+
+      - name: Checkout upstream Posit r-builds
+        uses: actions/checkout@v4
+        with:
+          repository: rstudio/r-builds
+          ref: ${{ inputs.posit_ref }}
+          path: posit-upstream
+          persist-credentials: false
+
+      - name: Validate input and prepare build context
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$R_VERSION" =~ ^4\.[56]\.[0-9]+$ ]]; then
+            echo 'Only R 4.5.x or 4.6.x version strings are accepted.' >&2
+            exit 1
+          fi
+          mkdir -p dist
+          install -m 0644 debian12/Dockerfile.debian-12 posit-upstream/builder/Dockerfile.debian-12
+          install -m 0644 debian12/package.debian-12 posit-upstream/builder/package.debian-12
+          git -C posit-upstream rev-parse HEAD > dist/posit-upstream-commit.txt
+          test -f posit-upstream/builder/build.sh
+          test -d posit-upstream/builder/patches
+
+      - name: Build Debian 12 builder image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --pull --progress=plain \
+            -f posit-upstream/builder/Dockerfile.debian-12 \
+            -t community-r:debian-12-builder \
+            posit-upstream/builder
+
+      - name: Compile R and create DEB and tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --env "R_VERSION=${R_VERSION}" \
+            --env 'LOCAL_STORE=/tmp/output' \
+            --env 'PACKAGE_VERSION=1' \
+            --env 'MAKEFLAGS=-j2' \
+            --volume "$GITHUB_WORKSPACE/dist:/tmp/output" \
+            community-r:debian-12-builder
+          ls -lh dist/debian-12/ dist/r/debian-12/
+          test -f "dist/debian-12/r-${R_VERSION}_1_amd64.deb"
+          test -f "dist/r/debian-12/R-${R_VERSION}-debian-12.tar.gz"
+
+      - name: Smoke-test the DEB inside clean Debian 12
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --env "R_VERSION=${R_VERSION}" \
+            --volume "$GITHUB_WORKSPACE/dist/debian-12:/packages:ro" \
+            debian:bookworm \
+            bash -euc '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y --no-install-recommends \
+                "/packages/r-${R_VERSION}_1_amd64.deb"
+              R_BIN="/opt/R/${R_VERSION}/bin/R"
+              RSCRIPT="/opt/R/${R_VERSION}/bin/Rscript"
+              "$R_BIN" --version
+              "$RSCRIPT" --vanilla -e '\''
+                stopifnot(as.character(getRversion()) == Sys.getenv("R_VERSION"))
+                print(sessionInfo())
+                print(capabilities())
+                stopifnot(isTRUE(capabilities("cairo")))
+                x <- matrix(seq_len(100), nrow = 10)
+                stopifnot(max(abs(crossprod(x) - t(x) %*% x)) < 1e-8)
+              '\''
+              test -s "/opt/R/${R_VERSION}/lib/R/lib/libR.so"
+              echo "R BLAS/LAPACK configuration:"
+              BLAS_FLAGS="$($R_BIN CMD config BLAS_LIBS)"
+              LAPACK_FLAGS="$($R_BIN CMD config LAPACK_LIBS)"
+              printf "BLAS_LIBS=%s\nLAPACK_LIBS=%s\n" "$BLAS_FLAGS" "$LAPACK_FLAGS"
+              test "$BLAS_FLAGS" = "-lblas"
+              test "$LAPACK_FLAGS" = "-llapack"
+              echo "Generic Debian BLAS/LAPACK alternatives:"
+              readlink -f /usr/lib/x86_64-linux-gnu/libblas.so.3
+              readlink -f /usr/lib/x86_64-linux-gnu/liblapack.so.3
+              readlink -f /usr/lib/x86_64-linux-gnu/libblas.so.3 | grep -qi openblas
+              readlink -f /usr/lib/x86_64-linux-gnu/liblapack.so.3 | grep -qi openblas
+              echo "BLAS dynamic linkage (informational):"
+              ldd "/opt/R/${R_VERSION}/lib/R/lib/libR.so" | grep -Ei "blas|lapack" || true
+              echo "Debian 12 native R, generic BLAS linkage, and OpenBLAS smoke tests passed."
+            '
+
+      - name: Prepare hashes and build metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd dist
+            sha256sum \
+              "debian-12/r-${R_VERSION}_1_amd64.deb" \
+              "r/debian-12/R-${R_VERSION}-debian-12.tar.gz" \
+              > SHA256SUMS
+            {
+              echo "R version: $R_VERSION"
+              echo "OS: Debian 12 (bookworm)"
+              echo "Architecture: amd64"
+              echo "Build strategy: upstream Posit r-builds/build.sh + community Debian 12 packaging"
+              echo "Upstream commit: $(cat posit-upstream-commit.txt)"
+              echo "Built at (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            } > BUILD-INFO.txt
+          )
+          cat dist/SHA256SUMS
+          cat dist/BUILD-INFO.txt
+
+      - name: Upload verified build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: r-${{ inputs.r_version }}-debian12-amd64
+          path: |
+            dist/debian-12/*.deb
+            dist/r/debian-12/*.tar.gz
+            dist/SHA256SUMS
+            dist/BUILD-INFO.txt
+            dist/posit-upstream-commit.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release (optional)
+        if: ${{ inputs.publish_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: r-${{ inputs.r_version }}-debian12-b1
+          name: R ${{ inputs.r_version }} / Debian 12 / amd64 (community build)
+          body: |
+            Unofficial Debian 12 native R build using upstream Posit r-builds scripts.
+            NOT an official Posit binary. CI checks installation, -lblas/-llapack linkage, and OpenBLAS in a clean Debian 12 container.
+            The install prefix is /opt/R/${{ inputs.r_version }}.
+            See BUILD-INFO.txt and SHA256SUMS for build provenance and checksums.
+          files: |
+            dist/debian-12/*.deb
+            dist/r/debian-12/*.tar.gz
+            dist/SHA256SUMS
+            dist/BUILD-INFO.txt
+            dist/posit-upstream-commit.txt
+          fail_on_unmatched_files: true
