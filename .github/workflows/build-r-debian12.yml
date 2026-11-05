@@ -4,10 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       r_version:
-        description: R release version (e.g. 4.6.2)
+        description: 'R version (latest = latest stable version on CRAN; e.g. 4.6.2)'
         required: true
         type: string
-        default: '4.6.2'
+        default: 'latest'
       posit_ref:
         description: rstudio/r-builds commit SHA, tag, or branch
         required: true
@@ -32,12 +32,30 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     env:
-      R_VERSION: ${{ inputs.r_version }}
+      REQUESTED_R_VERSION: ${{ inputs.r_version }}
       DEBIAN_FRONTEND: noninteractive
 
     steps:
       - name: Checkout this repository
         uses: actions/checkout@v4
+
+      - name: Resolve R version (only during manually triggered build)
+        id: resolve_r
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$REQUESTED_R_VERSION" == 'latest' ]]; then
+            r_version="$(python3 .github/scripts/latest_r.py)"
+          else
+            r_version="$REQUESTED_R_VERSION"
+          fi
+          if [[ ! "$r_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid R release version: $r_version" >&2
+            exit 1
+          fi
+          echo "R_VERSION=$r_version" >> "$GITHUB_ENV"
+          echo "r_version=$r_version" >> "$GITHUB_OUTPUT"
+          echo "Manual build selected R $r_version" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Checkout upstream Posit r-builds
         uses: actions/checkout@v4
@@ -51,10 +69,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ ! "$R_VERSION" =~ ^4\.[56]\.[0-9]+$ ]]; then
-            echo 'Only R 4.5.x or 4.6.x version strings are accepted.' >&2
-            exit 1
-          fi
           mkdir -p dist
           install -m 0644 debian12/Dockerfile.debian-12 posit-upstream/builder/Dockerfile.debian-12
           install -m 0644 debian12/package.debian-12 posit-upstream/builder/package.debian-12
@@ -152,7 +166,7 @@ jobs:
       - name: Upload verified build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: r-${{ inputs.r_version }}-debian12-amd64
+          name: r-${{ steps.resolve_r.outputs.r_version }}-debian12-amd64
           path: |
             dist/debian-12/*.deb
             dist/r/debian-12/*.tar.gz
@@ -166,12 +180,12 @@ jobs:
         if: ${{ inputs.publish_release }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: r-${{ inputs.r_version }}-debian12-b1
-          name: R ${{ inputs.r_version }} / Debian 12 / amd64 (community build)
+          tag_name: r-${{ steps.resolve_r.outputs.r_version }}-debian12-b1
+          name: R ${{ steps.resolve_r.outputs.r_version }} / Debian 12 / amd64 (community build)
           body: |
             Unofficial Debian 12 native R build using upstream Posit r-builds scripts.
             NOT an official Posit binary. CI checks installation, -lblas/-llapack linkage, and OpenBLAS in a clean Debian 12 container.
-            The install prefix is /opt/R/${{ inputs.r_version }}.
+            The install prefix is /opt/R/${{ steps.resolve_r.outputs.r_version }}.
             See BUILD-INFO.txt and SHA256SUMS for build provenance and checksums.
           files: |
             dist/debian-12/*.deb
