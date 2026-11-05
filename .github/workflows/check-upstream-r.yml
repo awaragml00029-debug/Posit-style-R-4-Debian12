@@ -1,0 +1,86 @@
+name: Check upstream R release (no build)
+
+on:
+  schedule:
+    # Daily at 08:37 UTC. This workflow NEVER triggers a build.
+    - cron: '37 8 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: upstream-r-version-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Detect current stable R release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Detect newest official CRAN R release
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          latest="$(python3 .github/scripts/latest_r.py)"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "Latest stable GNU R release: $latest"
+          {
+            echo '## Official R release check'
+            echo "- Latest stable R: **$latest**"
+            echo '- Source: https://cran.r-project.org/src/base/'
+            echo '- Build: **NOT started**; manual workflow_dispatch only.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create one GitHub Issue per new R version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST_R: ${{ steps.release.outputs.latest }}
+        run: |
+          set -euo pipefail
+          baseline="$(tr -d '[:space:]' < .github/r-version-baseline.txt)"
+          if [[ ! "$baseline" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid baseline: $baseline" >&2
+            exit 1
+          fi
+
+          # The baseline prevents opening a notification for the version that
+          # was already in use when the watch workflow was introduced.
+          if [[ "$LATEST_R" == "$baseline" ]] || \
+             [[ "$(printf '%s\n%s\n' "$LATEST_R" "$baseline" | sort -V | tail -n 1)" == "$baseline" ]]; then
+            echo "No new R release compared with baseline $baseline."
+            echo '- Notification: no new version since baseline.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          title="R $LATEST_R released — Debian 12 build is manual"
+          # Include closed issues, so a notification is not recreated every
+          # day after the maintainer closes it.
+          if gh issue list --state all --limit 1000 --json title --jq '.[].title' | grep -Fxq -- "$title"; then
+            echo "Issue for R $LATEST_R already exists; doing nothing."
+            echo '- Notification: existing issue found; no duplicate.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          {
+            echo "CRAN has published **R $LATEST_R** as a stable release."
+            echo
+            echo "Official source: https://cran.r-project.org/src/base/R-${LATEST_R%%.*}/R-${LATEST_R}.tar.gz"
+            echo
+            echo '### Manual action (no automatic build)'
+            echo '1. Open **Actions → Build Posit-style R for Debian 12 → Run workflow**.'
+            echo '2. Leave `r_version=latest` to resolve CRAN at build time, or enter the explicit version.'
+            echo '3. Inspect the Docker build and Debian 12 smoke tests before publishing anything.'
+            echo
+            echo 'This issue was created by the release-check workflow. **No build was started.**'
+          } > "$RUNNER_TEMP/r-release-issue.md"
+
+          gh issue create --title "$title" --body-file "$RUNNER_TEMP/r-release-issue.md"
+          echo '- Notification: created one GitHub Issue (no build).' >> "$GITHUB_STEP_SUMMARY"
