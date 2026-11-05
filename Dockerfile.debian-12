@@ -1,0 +1,47 @@
+# Posit-style *native* Debian 12 R builder (unofficial).
+# Restore the platform that upstream discontinued without changing Posit's build.sh.
+FROM debian:bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    OS_IDENTIFIER=debian-12 \
+    PAGER=/usr/bin/pager
+
+# Restore Debian source indexes for `apt-get build-dep r-base`, like the
+# historical Posit Debian 12 Dockerfile.  Use libopenblas0-pthread (runtime),
+# deliberately NOT libopenblas-dev (linker shim).  This is critical for
+# BLAS_LIBS=-lblas / LAPACK_LIBS=-llapack and Debian alternatives support.
+RUN set -eux; \
+    if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+      sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/debian.sources; \
+    else \
+      echo 'deb-src http://deb.debian.org/debian bookworm main' >> /etc/apt/sources.list; \
+    fi; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      ca-certificates curl wget xz-utils unzip \
+      gcc g++ gfortran make \
+      libcurl4-openssl-dev libicu-dev libpcre2-dev \
+      libopenblas0-pthread libzstd-dev libdeflate-dev; \
+    apt-get build-dep -y --no-install-recommends r-base; \
+    dpkg-query -W libblas-dev liblapack-dev libopenblas0-pthread; \
+    if dpkg-query -W -f='${Status}' libopenblas-dev 2>/dev/null | grep -q 'install ok installed'; then \
+      echo 'Unexpected libopenblas-dev: would compromise generic -lblas linking' >&2; \
+      exit 1; \
+    fi; \
+    rm -rf /var/lib/apt/lists/*
+
+ARG NFPM_VERSION=2.18.1
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    curl -fSL --retry 3 \
+      "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${arch}.deb" \
+      -o /tmp/nfpm.deb; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends /tmp/nfpm.deb; \
+    rm -f /tmp/nfpm.deb; \
+    rm -rf /var/lib/apt/lists/*
+
+COPY package.debian-12 /package.sh
+COPY build.sh /build.sh
+COPY patches /patches
+ENTRYPOINT ["/bin/bash", "/build.sh"]

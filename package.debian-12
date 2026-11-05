@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Community Debian 12 packaging, sourced by upstream r-builds/builder/build.sh.
+set -e
+
+mkdir -p "/tmp/output/${OS_IDENTIFIER}"
+
+zstd_dep=''
+if grep -Eq '^(LIBS|R_XTRA_LIBS) *=.*-lzstd' "${R_INSTALL_PATH}/lib/R/etc/Makeconf"; then
+  zstd_dep='  - libzstd-dev'
+fi
+deflate_dep=''
+if grep -Eq '^(LIBS|R_XTRA_LIBS) *=.*-ldeflate' "${R_INSTALL_PATH}/lib/R/etc/Makeconf"; then
+  deflate_dep='  - libdeflate-dev'
+fi
+
+cat > /tmp/r-debian12-nfpm.yaml <<EOF_YAML
+name: r-${R_VERSION}
+version: ${PACKAGE_VERSION:-1}
+version_schema: none
+section: gnu-r
+arch: $(dpkg --print-architecture)
+priority: optional
+maintainer: Community R build contributors
+description: |
+  GNU R built on Debian 12 with upstream Posit r-builds compilation scripts.
+  Community project; not an official Posit build.
+vendor: Independent community build
+homepage: https://www.r-project.org
+license: GPL-2.0-or-later
+depends:
+  - ca-certificates
+  - gcc
+  - g++
+  - gfortran
+  - make
+  - libc6
+  - libblas-dev
+  - liblapack-dev
+  - libopenblas0-pthread
+  - libbz2-dev
+  - zlib1g-dev
+  - liblzma-dev
+  - libcurl4-openssl-dev
+  - libicu-dev
+  - libpcre2-dev
+  - libgomp1
+  - libcairo2
+  - libglib2.0-0
+  - libpango-1.0-0
+  - libpangocairo-1.0-0
+  - libpaper-utils
+  - libpng16-16
+  - libreadline8
+  - libtcl8.6
+  - libtk8.6
+  - libtiff6
+  - libtirpc-dev
+  - libx11-6
+  - libxt6
+  - ucf
+  - unzip
+  - zip
+${zstd_dep}
+${deflate_dep}
+contents:
+  - src: ${R_INSTALL_PATH}
+    dst: ${R_INSTALL_PATH}
+EOF_YAML
+
+nfpm package --config /tmp/r-debian12-nfpm.yaml --packager deb \
+  --target "/tmp/output/${OS_IDENTIFIER}/"
+
+PKG_FILE=$(find "/tmp/output/${OS_IDENTIFIER}" -maxdepth 1 -name "r-${R_VERSION}_*.deb" -print -quit)
+export PKG_FILE
+test -n "$PKG_FILE"
+echo "Created DEB: $PKG_FILE"
