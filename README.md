@@ -1,74 +1,113 @@
-# Debian 12 native R, Posit-style GitHub Actions (v2)
+# Debian 12 Posit-style R builds + upstream release watch (v3)
 
-**Unofficial/community build, not a Posit release.**
+**Community build. Not an official Posit binary.**
 
-This project restores native **Debian 12 Bookworm** builds using the upstream [rstudio/r-builds](https://github.com/rstudio/r-builds) `builder/build.sh` and `patches`, and a Debian 12 build environment modeled after Posit's historical Debian 12 Dockerfile.
+This repository builds native amd64 R on **Debian 12 Bookworm** using upstream
+[`rstudio/r-builds`](https://github.com/rstudio/r-builds) compilation scripts,
+restoring the discontinued Debian 12 builder. The original v2 pipeline has been
+validated in GitHub Actions and on a separate Debian 12 machine with R 4.6.2,
+including generic BLAS/LAPACK linkage and Intel oneMKL 2026.2 numerical tests.
 
-## Why v2?
+**v3 adds a release checker; it does not add automatic builds.**
 
-The previous archive installed **`libopenblas-dev` in the build container**. Posit's native Ubuntu and historical Debian instructions deliberately install only `libopenblas0-pthread` and let `r-base` build dependencies bring in `libblas-dev` and `liblapack-dev`. This makes R link via **generic `-lblas` and `-llapack`**, allowing the Debian `update-alternatives` system to choose OpenBLAS or a separately installed MKL later.
+## What is new in v3?
 
-This revision removes `libopenblas-dev` from the build stage, uses `apt-get build-dep r-base` like the historical Posit recipe, updates `.deb` runtime dependencies, and makes the smoke test assert generic linkage **plus** OpenBLAS runtime selection. It does NOT include MKL and does NOT touch any existing server's alternatives. The CI test runs inside a disposable Debian 12 container.
+| Workflow | Trigger | Behavior |
+|---|---|---|
+| `Check upstream R release (no build)` | Every day 08:37 UTC; also `Run workflow` | Reads CRAN's official stable source release index; writes the detected version into the Actions run summary. When a newer version appears, opens exactly one GitHub Issue for that version (including after that issue has been closed). **Never compiles R.** |
+| `Build Posit-style R for Debian 12` | **Manual `Run workflow` only** | Builds Debian 12 `.deb` and tarball, smoke-tests installation, uploads artifacts. Default `r_version=latest` resolves the latest official CRAN stable release **at the time you click Run workflow**. Can still build a specific version such as `4.6.2`. |
+
+The initial version baseline is `.github/r-version-baseline.txt` = `4.6.2`.
+That avoids an unnecessary notification on the first check. Do not change it
+unless you intentionally want a different minimum version for notifications.
+
+The detector reads `src/base/` and then the newest `R-MAJOR/` directory,
+looking for official `R-x.y.z.tar.gz` release tarballs. It does not use
+R-devel, R-patched, or CRAN pre-release directories. It uses only Python's
+standard library, with CRAN and two CRAN mirror fallbacks.
 
 ## Files
 
 ```text
-.github/workflows/build-r-debian12.yml
+.github/
+├── r-version-baseline.txt
+├── scripts/
+│   └── latest_r.py
+└── workflows/
+    ├── build-r-debian12.yml       # manual build only
+    └── check-upstream-r.yml       # daily check, NO build
 README.md
-debian12/Dockerfile.debian-12
-debian12/package.debian-12
+debian12/
+├── Dockerfile.debian-12
+└── package.debian-12
 ```
 
-## Run
+## Upgrade from v2 (the version you have already run)
 
-1. Upload these files (including hidden `.github/`) to a new GitHub repository's default branch.
-2. Go to **Actions → Build Posit-style R for Debian 12 → Run workflow**.
-3. Set `r_version=4.6.2`, `posit_ref=main`, `publish_release=false` for the first test.
-4. Inspect the clean-container test's `sessionInfo()`, `BLAS_LIBS`, `LAPACK_LIBS`, and alternatives symlinks.
-5. Download the Actions artifact containing the `.deb`, tarball, SHA256SUMS and upstream commit SHA. On success, pin `posit_ref` to the exact commit printed in the artifact.
+Copy these **four** additions/changes to your repo's **default branch**:
 
-With `publish_release=true`, the workflow can also publish a GitHub Release after its tests pass.
+1. **Replace** `.github/workflows/build-r-debian12.yml` with v3.
+2. **Add** `.github/workflows/check-upstream-r.yml`.
+3. **Add** `.github/scripts/latest_r.py`.
+4. **Add** `.github/r-version-baseline.txt`.
 
-Expected artifact paths:
+`debian12/Dockerfile.debian-12` and `debian12/package.debian-12` are unchanged.
+
+The check workflow needs repository **Issues enabled** and uses only the
+workflow's standard `GITHUB_TOKEN`, with `issues: write` and `contents: read`.
+No personal access token, webhook, email, or external service is needed.
+The default branch is required for scheduled Actions workflows.
+
+### First check
+
+Go to **Actions → Check upstream R release (no build) → Run workflow**.
+The summary should show the current official R version and explicitly say
+"Build: NOT started". No issue should be created when CRAN is still at the
+baseline `4.6.2`. A new official release such as R `4.6.3` will generate a
+single issue (including if you later close it).
+
+### Manual build
+
+Go to **Actions → Build Posit-style R for Debian 12 → Run workflow** and set:
+
+- `r_version`: `latest` (default), or a fixed release such as `4.6.2`;
+- `posit_ref`: `main` or (recommended for reproducibility) a proven Posit commit SHA;
+- `publish_release`: `false` (default) until the build passes your checks.
+
+There is intentionally **no `schedule`, `workflow_run`, `push`, or `repository_dispatch`
+trigger on the build workflow**. A new issue or a daily check will **never**
+automatically run the 6-minute R compilation.
+
+## Validation
+
+`Build Posit-style R for Debian 12` verifies R startup, Cairo, BLAS matrix
+multiplication, `-lblas/-llapack` generic linkage and OpenBLAS alternatives
+inside a clean `debian:bookworm` container. Existing Posit R versions, MKL
+configuration, and single-cell package libraries are not touched.
+
+R 4.6.2 was additionally validated by the maintainer on a Debian 12 machine:
 
 ```text
-debian-12/r-4.6.2_1_amd64.deb
-r/debian-12/R-4.6.2-debian-12.tar.gz
-SHA256SUMS
-BUILD-INFO.txt
-posit-upstream-commit.txt
+R 4.6.2 (2026-10-29)
+BLAS_LIBS = -lblas
+LAPACK_LIBS = -llapack
+BLAS/LAPACK = /opt/intel/oneapi/mkl/2026.2/lib/libmkl_rt.so.3
+crossprod(), eigen(): PASS
 ```
 
-## Build and test expectations
+This does not imply future R releases or all Seurat/Bioconductor packages have
+been validated. New R versions remain explicitly opt-in.
 
-- Real `debian:bookworm` compilation, not Ubuntu or manylinux cross-compatibility.
-- `/opt/R/4.6.2` installation path, no `/usr/bin/R` replacement.
-- Posit's default build options (including `--enable-R-shlib`, `--enable-memory-profiling`, `--with-blas`, `--with-lapack`).
-- Generic `R CMD config BLAS_LIBS` = `-lblas` and `LAPACK_LIBS` = `-llapack`.
-- In a clean Bookworm test environment, both alternatives point to OpenBLAS.
-- Basic R startup, Cairo capability, library existence, and matrix calculation tests.
+## Caveats
 
-## MKL policy
-
-**MKL is intentionally not installed or configured.** Your existing Posit R 4.5.2 on Debian 12 already uses `update-alternatives` pointing both generic BLAS and LAPACK to Intel oneMKL 2026.2, with `MKL_INTERFACE_LAYER=GNU,LP64` and 3 threads. This v2 build is designed to keep that switching model open for a *separate later compatibility test*. It does not change any live system or claim that R 4.6.2 + MKL is fully validated.
-
-## Optional manual install (only in a disposable Debian 12 environment at first)
-
-After downloading the Actions artifact and extracting it, run:
-
-```bash
-sha256sum -c SHA256SUMS
-sudo apt-get install ./debian-12/r-4.6.2_1_amd64.deb
-/opt/R/4.6.2/bin/Rscript --vanilla -e 'sessionInfo()'
-```
-
-On a machine where the current alternatives already select MKL, the new R will also dynamically resolve those system BLAS/LAPACK links. Test MKL with R 4.6 separately before relying on it; never treat installing a new version of R as a zero-risk change to the whole server.
-
-## Limitations and reproducibility
-
-- This zip is statically checked but **not end-to-end compiled here** (Docker/Actions execution was unavailable). The CI build itself is the first actual compilation and installation test.
-- Builds are *Posit-style*, not byte-for-byte Posit binaries. `debian:bookworm`, apt sources, upstream Posit `main`, and R sources can change. Pin upstream commit, container digest, and Debian package snapshot for stronger reproducibility.
-- The result is amd64 only. Builds may be time/disk intensive. R 4.5.x and 4.6.x are the allowed version families in the workflow.
-- Clean-container smoke tests do not prove that all Seurat/Bioconductor packages work. Keep your existing R 4.5.2 and all package libraries intact.
-
-Sources: [current Posit r-builds](https://github.com/rstudio/r-builds), [historical Debian 12 builder](https://github.com/r-hub/r-builds/blob/main/builder/Dockerfile.debian-12), [Posit's Ubuntu builder](https://github.com/rstudio/r-builds/blob/main/builder/Dockerfile.ubuntu-2404), [Posit source installation docs](https://docs.posit.co/resources/install-r-source.html).
+- Scheduled GitHub Actions are run from the default branch in UTC; they may be
+  delayed. GitHub may disable schedules in inactive public repositories after
+  60 days; re-enable the check if necessary.
+- If repository Issues are disabled, the notification step fails; enable Issues
+  in **Settings → General → Features → Issues**. No build will be triggered.
+- If CRAN is unavailable, version detection fails rather than guessing.
+  Manual build with an explicit version such as `4.6.2` still works.
+- For reproducibility, use an explicit R version and pinned `posit_ref` rather
+  than `latest` and `main`.
+- A future major R release is detectable by the watcher but may require
+  revising upstream build scripts or Debian 12 dependencies before it compiles.
