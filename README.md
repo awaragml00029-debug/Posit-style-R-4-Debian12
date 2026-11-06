@@ -1,113 +1,176 @@
-# Debian 12 Posit-style R builds + upstream release watch (v3)
+# Debian 12 Posit-style R — v4/v4.1
 
-**Community build. Not an official Posit binary.**
+**Unofficial community build, not an official Posit binary.** Uses the upstream
+[`rstudio/r-builds`](https://github.com/rstudio/r-builds) compilation script and
+restores its retired Debian 12 builder. The Debian 12 Dockerfile and nFPM
+packaging script are **unchanged from the previously tested v3**.
 
-This repository builds native amd64 R on **Debian 12 Bookworm** using upstream
-[`rstudio/r-builds`](https://github.com/rstudio/r-builds) compilation scripts,
-restoring the discontinued Debian 12 builder. The original v2 pipeline has been
-validated in GitHub Actions and on a separate Debian 12 machine with R 4.6.2,
-including generic BLAS/LAPACK linkage and Intel oneMKL 2026.2 numerical tests.
+These workflows are designed for a repository hosted on **GitHub.com** with Actions
+enabled. The original v3 build of R 4.6.2 passed GitHub Actions and also passed
+Debian 12 real-machine smoke tests, including MKL linkage through Debian alternatives.
+**v4/v4.1 has been syntax-checked but has not yet completed a real GitHub Actions run.**
 
-**v3 adds a release checker; it does not add automatic builds.**
+## Crucial safety rule: no automatic compilation or publication
 
-## What is new in v3?
-
-| Workflow | Trigger | Behavior |
+| Workflow | Trigger | What it does |
 |---|---|---|
-| `Check upstream R release (no build)` | Every day 08:37 UTC; also `Run workflow` | Reads CRAN's official stable source release index; writes the detected version into the Actions run summary. When a newer version appears, opens exactly one GitHub Issue for that version (including after that issue has been closed). **Never compiles R.** |
-| `Build Posit-style R for Debian 12` | **Manual `Run workflow` only** | Builds Debian 12 `.deb` and tarball, smoke-tests installation, uploads artifacts. Default `r_version=latest` resolves the latest official CRAN stable release **at the time you click Run workflow**. Can still build a specific version such as `4.6.2`. |
+| `Check upstream R release (no build)` | Daily / manual | Reads CRAN stable-version list, opens one Issue for a newer version; **never builds** |
+| `Build Posit-style R for Debian 12` | **Manual Run workflow only** | Builds and tests the package, then saves a 30-day Actions artifact; **never creates a release** |
+| `Publish verified R artifact (manual only)` | **Manual Run workflow only** | Verifies and republishes the exact artifact from a successful build run; **never recompiles R** |
 
-The initial version baseline is `.github/r-version-baseline.txt` = `4.6.2`.
-That avoids an unnecessary notification on the first check. Do not change it
-unless you intentionally want a different minimum version for notifications.
-
-The detector reads `src/base/` and then the newest `R-MAJOR/` directory,
-looking for official `R-x.y.z.tar.gz` release tarballs. It does not use
-R-devel, R-patched, or CRAN pre-release directories. It uses only Python's
-standard library, with CRAN and two CRAN mirror fallbacks.
+The build and publish workflows have no `push`, `schedule`, `workflow_run`, or
+`repository_dispatch` triggers.
 
 ## Files
 
 ```text
 .github/
-├── r-version-baseline.txt
-├── scripts/
-│   └── latest_r.py
-└── workflows/
-    ├── build-r-debian12.yml       # manual build only
-    └── check-upstream-r.yml       # daily check, NO build
-README.md
+  r-version-baseline.txt
+  scripts/
+    latest_r.py             # unchanged v3 stable-release detector
+    write_manifest.py       # v4 build provenance
+    verify_artifact.py      # v4.1 promotion checks
+  workflows/
+    check-upstream-r.yml    # unchanged v3 version check
+    build-r-debian12.yml    # v4, manual only
+    publish-release.yml     # v4.1, manual only
+
 debian12/
-├── Dockerfile.debian-12
-└── package.debian-12
+  Dockerfile.debian-12      # unchanged from working v3
+  package.debian-12         # unchanged from working v3
+README.md
 ```
 
-## Upgrade from v2 (the version you have already run)
+### Upgrade an existing v3 repository
 
-Copy these **four** additions/changes to your repo's **default branch**:
+Copy **all files** from the ZIP into your existing repository, preserving the
+folders. The old `publish_release` parameter is **removed** from the build
+workflow on purpose. Do not keep the old in-build `softprops/action-gh-release`
+step. You may keep the existing default branch and existing GitHub Issues.
 
-1. **Replace** `.github/workflows/build-r-debian12.yml` with v3.
-2. **Add** `.github/workflows/check-upstream-r.yml`.
-3. **Add** `.github/scripts/latest_r.py`.
-4. **Add** `.github/r-version-baseline.txt`.
-
-`debian12/Dockerfile.debian-12` and `debian12/package.debian-12` are unchanged.
-
-The check workflow needs repository **Issues enabled** and uses only the
-workflow's standard `GITHUB_TOKEN`, with `issues: write` and `contents: read`.
-No personal access token, webhook, email, or external service is needed.
-The default branch is required for scheduled Actions workflows.
-
-### First check
-
-Go to **Actions → Check upstream R release (no build) → Run workflow**.
-The summary should show the current official R version and explicitly say
-"Build: NOT started". No issue should be created when CRAN is still at the
-baseline `4.6.2`. A new official release such as R `4.6.3` will generate a
-single issue (including if you later close it).
-
-### Manual build
+## Step A — Manually build
 
 Go to **Actions → Build Posit-style R for Debian 12 → Run workflow** and set:
 
-- `r_version`: `latest` (default), or a fixed release such as `4.6.2`;
-- `posit_ref`: `main` or (recommended for reproducibility) a proven Posit commit SHA;
-- `publish_release`: `false` (default) until the build passes your checks.
+- `r_version`: `latest` or an exact release such as `4.6.2`.
+- `posit_ref`: a **full 40-character upstream commit SHA** for reproducibility,
+  or `main` for an exploratory first build. After checkout, the workflow **freezes
+  the resolved exact commit** for that run; it writes the SHA to the manifest.
+- `debian_base_ref`: `debian:bookworm`, or an exact previously recorded
+  `debian@sha256:...` digest. The workflow resolves the tag to a digest **before
+  building**, then builds using that frozen digest.
 
-There is intentionally **no `schedule`, `workflow_run`, `push`, or `repository_dispatch`
-trigger on the build workflow**. A new issue or a daily check will **never**
-automatically run the 6-minute R compilation.
+**How to repeat an earlier build as closely as possible:** get its
+`BUILD-MANIFEST.json`, copy the `rebuild_inputs` values into the next manual
+build. Do **not** use `main`/`latest` if you want repeatable inputs.
 
-## Validation
+The workflow keeps the known-good Posit build script and Debian 12 package
+configuration. The smoke test checks `R --version`, Cairo, a BLAS matrix
+operation, generic `-lblas/-llapack` flags, Debian OpenBLAS alternatives, and
+**installs Rcpp from source and evaluates compiled C++ code** in an isolated
+container. It does not touch any single-cell analysis library on a real server.
 
-`Build Posit-style R for Debian 12` verifies R startup, Cairo, BLAS matrix
-multiplication, `-lblas/-llapack` generic linkage and OpenBLAS alternatives
-inside a clean `debian:bookworm` container. Existing Posit R versions, MKL
-configuration, and single-cell package libraries are not touched.
-
-R 4.6.2 was additionally validated by the maintainer on a Debian 12 machine:
+Successful output: an Artifact named like `r-4.6.2-debian12-amd64`, containing
 
 ```text
-R 4.6.2 (2026-10-29)
-BLAS_LIBS = -lblas
-LAPACK_LIBS = -llapack
-BLAS/LAPACK = /opt/intel/oneapi/mkl/2026.2/lib/libmkl_rt.so.3
-crossprod(), eigen(): PASS
+debian-12/r-4.6.2_1_amd64.deb
+r/debian-12/R-4.6.2-debian-12.tar.gz
+BUILD-MANIFEST.json
+BUILD-ENVIRONMENT.txt
+BUILD-INFO.txt
+TEST-REPORT.txt
+SHA256SUMS
+posit-upstream-commit.txt
+debian-base-image.txt
+r-source-reference-sha256.txt
+rcpp-smoke-version.txt
+local-build-files-sha256.txt
+builder-image-id.txt
 ```
 
-This does not imply future R releases or all Seurat/Bioconductor packages have
-been validated. New R versions remain explicitly opt-in.
+`BUILD-MANIFEST.json` tracks R version, upstream SHA, Debian base digest,
+R source reference SHA256, local builder scripts' hashes, toolchain/dependency
+inventory, binary SHA256 hashes, GitHub workflow commit/run, tested Rcpp version,
+and full re-run inputs. `SHA256SUMS` covers all files in the artifact.
 
-## Caveats
+### Important reproducibility limitation
 
-- Scheduled GitHub Actions are run from the default branch in UTC; they may be
-  delayed. GitHub may disable schedules in inactive public repositories after
-  60 days; re-enable the check if necessary.
-- If repository Issues are disabled, the notification step fails; enable Issues
-  in **Settings → General → Features → Issues**. No build will be triggered.
-- If CRAN is unavailable, version detection fails rather than guessing.
-  Manual build with an explicit version such as `4.6.2` still works.
-- For reproducibility, use an explicit R version and pinned `posit_ref` rather
-  than `latest` and `main`.
-- A future major R release is detectable by the watcher but may require
-  revising upstream build scripts or Debian 12 dependencies before it compiles.
+This is **traceable and repeatable-input building**, not guaranteed bit-for-bit
+reproducibility. The original Posit `build.sh` **downloads R source independently**;
+CI records the SHA256 of a CRAN reference source tarball but does **not attest
+that the separately downloaded bytes are identical**. In addition, `apt` packages
+and the newest CRAN Rcpp source test can change over time. The build environment
+records exact `dpkg-query` versions and the Rcpp version that passed. For
+fully hermetic builds, a future revision must pin apt repositories, Rcpp source,
+and verify the in-builder R tarball against the reference SHA; those changes are
+intentionally not made to the already working compilation pipeline here.
+
+## Step B — Manually promote the exact successful Artifact to a Release
+
+1. Open the **successful Build Posit-style R for Debian 12** run. Copy the numeric
+   **run ID** from its URL, e.g. `https://github.com/OWNER/REPO/actions/runs/123456789`.
+2. Confirm you are satisfied with the build and smoke tests. You can also test
+   the Artifact on an isolated Debian 12 machine before promotion.
+3. Go to **Actions → Publish verified R artifact (manual only) → Run workflow**.
+4. Enter `build_run_id=123456789`, keep `draft_release=true` initially.
+5. When the publish workflow succeeds, review the draft under **Releases** and
+   click **Publish release** when ready. Alternatively, manually run with
+   `draft_release=false` to publish immediately.
+
+The promotion workflow checks the GitHub API to establish that the source run:
+- belongs to this repository and the actual build workflow;
+- was **manually dispatched** and finished with conclusion `success`;
+- has exactly one non-expired artifact with the expected R-build naming format.
+
+It downloads **only that Artifact**, checks `SHA256SUMS`, validates manifest
+run ID/attempt/source-commit against the API, validates `.deb`/tar.gz hashes,
+and requires an Rcpp PASS report. It **does not run Docker, compile R, or
+repackage any payload**. The Release tag includes the build run ID, e.g.
+`r-4.6.2-debian12-run123456789`, avoiding collisions between builds.
+
+The Release tag targets the source repository commit of the original build, not
+the commit of the separate publishing workflow.
+
+**Artifact retention:** GitHub Actions artifacts expire (here after 30 days).
+If you do not promote within that period, run a **new manual build**. Releases
+persist independently of Actions artifact retention, subject to repository
+settings and GitHub's policies.
+
+## Installing on Debian 12
+
+Only install on **Debian 12 amd64**, not Ubuntu 22.04. Before installation,
+check `SHA256SUMS` from the downloaded Artifact:
+
+```bash
+sha256sum -c SHA256SUMS
+sudo apt install ./debian-12/r-4.6.2_1_amd64.deb
+/opt/R/4.6.2/bin/Rscript --vanilla -e 'sessionInfo()'
+/opt/R/4.6.2/bin/R CMD config BLAS_LIBS
+/opt/R/4.6.2/bin/R CMD config LAPACK_LIBS
+```
+
+`-lblas` / `-llapack` uses Debian alternatives, allowing compatible system
+OpenBLAS or Intel oneMKL configurations. CI validates OpenBLAS, **not MKL**.
+R 4.6 may require selective recompilation of old R 4.5 binary packages; do not
+assume an existing Seurat library is automatically compatible.
+
+## Token permissions and security
+
+- Build: only `contents: read`.
+- Publisher: `actions: read` and `contents: write` to create the Release.
+- R-version watcher: `contents: read`, `issues: write`, as in v3.
+- Uses `GITHUB_TOKEN`, no PAT or secrets required.
+- `actions/checkout` and `actions/upload-artifact` use full immutable action
+  commits in v4; other v3 components remain unchanged.
+- `gh` and `jq` are available on GitHub-hosted Ubuntu runners.
+
+Recommended repository settings: Issues enabled for the watcher; protect the
+default branch and require review for changes to workflows and build scripts.
+
+## References
+
+- Upstream R build tooling: https://github.com/rstudio/r-builds
+- R source: https://cran.r-project.org/src/base/
+- GitHub Actions artifacts: https://docs.github.com/en/actions/using-workflows/storing-workflow-data-as-artifacts
+- GitHub CLI release create: https://cli.github.com/manual/gh_release_create
+
