@@ -1,26 +1,27 @@
 name: Build Posit-style R for Debian 12
 
+# Deliberately manual-only; release happens in a separate manual workflow.
 on:
   workflow_dispatch:
     inputs:
       r_version:
-        description: 'R version (latest = latest stable version on CRAN; e.g. 4.6.2)'
+        description: 'R version: latest or e.g. 4.6.2'
         required: true
         type: string
         default: 'latest'
       posit_ref:
-        description: rstudio/r-builds commit SHA, tag, or branch
+        description: 'Posit 40-character commit SHA (recommended), or main for a new test'
         required: true
         type: string
         default: 'main'
-      publish_release:
-        description: Publish GitHub Release after successful build and test
+      debian_base_ref:
+        description: 'Debian base image: tag or pinned repo@sha256 digest'
         required: true
-        type: boolean
-        default: false
+        type: string
+        default: 'debian:bookworm'
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: r-debian12-${{ inputs.r_version }}
@@ -33,48 +34,93 @@ jobs:
     timeout-minutes: 360
     env:
       REQUESTED_R_VERSION: ${{ inputs.r_version }}
+      REQUESTED_POSIT_REF: ${{ inputs.posit_ref }}
+      DEBIAN_BASE_REF: ${{ inputs.debian_base_ref }}
       DEBIAN_FRONTEND: noninteractive
 
     steps:
       - name: Checkout this repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Resolve R version (only during manually triggered build)
-        id: resolve_r
+      - name: Resolve version, verify input, and download reference R source
+        id: resolve
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "$REQUESTED_R_VERSION" == 'latest' ]]; then
+          if [[ "$REQUESTED_R_VERSION" == latest ]]; then
             r_version="$(python3 .github/scripts/latest_r.py)"
           else
             r_version="$REQUESTED_R_VERSION"
           fi
-          if [[ ! "$r_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Invalid R release version: $r_version" >&2
-            exit 1
-          fi
+          [[ "$r_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Invalid release version: $r_version" >&2; exit 1;
+          }
+          [[ "$REQUESTED_POSIT_REF" == main || "$REQUESTED_POSIT_REF" =~ ^[a-fA-F0-9]{40}$ ]] || {
+            echo 'posit_ref must be main or an exact 40-character Git commit SHA' >&2; exit 1;
+          }
+          [[ "$DEBIAN_BASE_REF" == debian:bookworm || "$DEBIAN_BASE_REF" =~ ^debian(@|:bookworm@)sha256:[a-fA-F0-9]{64}$ ]] || {
+            echo 'debian_base_ref must be debian:bookworm or a Debian image digest' >&2; exit 1;
+          }
+          mkdir -p dist
           echo "R_VERSION=$r_version" >> "$GITHUB_ENV"
           echo "r_version=$r_version" >> "$GITHUB_OUTPUT"
-          echo "Manual build selected R $r_version" >> "$GITHUB_STEP_SUMMARY"
+          source_url="https://cran.r-project.org/src/base/R-${r_version%%.*}/R-${r_version}.tar.gz"
+          echo "R_SOURCE_URL=$source_url" >> "$GITHUB_ENV"
+          curl -fsSL --retry 3 --connect-timeout 20 "$source_url" -o /tmp/R-source-reference.tar.gz
+          tar tzf /tmp/R-source-reference.tar.gz >/dev/null
+          sha256sum /tmp/R-source-reference.tar.gz | awk '{print $1}' > dist/r-source-reference-sha256.txt
+          echo "Official CRAN source reference: $source_url"
+          echo "SHA256: $(cat dist/r-source-reference-sha256.txt)"
+          # The upstream build.sh independently downloads the same release tarball.
+          # This is a provenance reference, NOT proof of byte-for-byte identity
+          # with build.sh's internal download.
 
       - name: Checkout upstream Posit r-builds
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: rstudio/r-builds
           ref: ${{ inputs.posit_ref }}
           path: posit-upstream
           persist-credentials: false
 
-      - name: Validate input and prepare build context
+      - name: Resolve and freeze exact Posit commit
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist
-          install -m 0644 debian12/Dockerfile.debian-12 posit-upstream/builder/Dockerfile.debian-12
-          install -m 0644 debian12/package.debian-12 posit-upstream/builder/package.debian-12
-          git -C posit-upstream rev-parse HEAD > dist/posit-upstream-commit.txt
+          sha="$(git -C posit-upstream rev-parse --verify HEAD)"
+          [[ "$sha" =~ ^[a-f0-9]{40}$ ]]
+          git -C posit-upstream checkout --quiet --detach "$sha"
+          test "$(git -C posit-upstream rev-parse HEAD)" = "$sha"
+          printf '%s\n' "$sha" > dist/posit-upstream-commit.txt
           test -f posit-upstream/builder/build.sh
           test -d posit-upstream/builder/patches
+          echo "Pinned Posit build commit for this run: $sha" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Resolve and freeze exact Debian base-image digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "$DEBIAN_BASE_REF"
+          digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "$DEBIAN_BASE_REF")"
+          [[ "$digest" =~ ^debian@sha256:[a-f0-9]{64}$ ]] || {
+            echo "Unexpected Docker image digest: $digest" >&2; exit 1;
+          }
+          printf '%s\n' "$digest" > dist/debian-base-image.txt
+          echo "BASE_IMAGE_DIGEST=$digest" >> "$GITHUB_ENV"
+          echo "Pinned Debian base image: $digest" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Prepare upstream build context using frozen base image
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -m 0644 debian12/Dockerfile.debian-12 posit-upstream/builder/Dockerfile.debian-12
+          install -m 0644 debian12/package.debian-12 posit-upstream/builder/package.debian-12
+          grep -qx 'FROM debian:bookworm' <(head -n 4 posit-upstream/builder/Dockerfile.debian-12 | grep '^FROM ')
+          sed -i "s|^FROM debian:bookworm$|FROM ${BASE_IMAGE_DIGEST}|" \
+            posit-upstream/builder/Dockerfile.debian-12
+          grep -q "^FROM ${BASE_IMAGE_DIGEST}$" posit-upstream/builder/Dockerfile.debian-12
+          sha256sum debian12/Dockerfile.debian-12 debian12/package.debian-12 \
+            > dist/local-build-files-sha256.txt
 
       - name: Build Debian 12 builder image
         shell: bash
@@ -84,32 +130,51 @@ jobs:
             -f posit-upstream/builder/Dockerfile.debian-12 \
             -t community-r:debian-12-builder \
             posit-upstream/builder
+          docker image inspect --format '{{.Id}}' community-r:debian-12-builder \
+            > dist/builder-image-id.txt
 
-      - name: Compile R and create DEB and tarball
+      - name: Record compiler and full build dependency inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint /bin/bash community-r:debian-12-builder -euc '
+            printf "OS: "; cat /etc/debian_version
+            printf "Architecture: "; dpkg --print-architecture
+            printf "glibc: "; ldd --version | head -n 1
+            printf "GCC: "; gcc -dumpfullversion
+            printf "G++: "; g++ -dumpfullversion
+            printf "gfortran: "; gfortran -dumpfullversion
+            printf "\nInstalled build packages (name/version):\n"
+            dpkg-query -W -f="\${Package}\t\${Version}\n" | sort
+          ' > dist/BUILD-ENVIRONMENT.txt
+          test -s dist/BUILD-ENVIRONMENT.txt
+
+      - name: Compile R and create DEB and tarball (upstream Posit script)
         shell: bash
         run: |
           set -euo pipefail
           docker run --rm \
             --env "R_VERSION=${R_VERSION}" \
+            --env 'CRAN=https://cran.r-project.org' \
             --env 'LOCAL_STORE=/tmp/output' \
             --env 'PACKAGE_VERSION=1' \
             --env 'MAKEFLAGS=-j2' \
             --volume "$GITHUB_WORKSPACE/dist:/tmp/output" \
             community-r:debian-12-builder
-          ls -lh dist/debian-12/ dist/r/debian-12/
-          test -f "dist/debian-12/r-${R_VERSION}_1_amd64.deb"
-          test -f "dist/r/debian-12/R-${R_VERSION}-debian-12.tar.gz"
+          test -s "dist/debian-12/r-${R_VERSION}_1_amd64.deb"
+          test -s "dist/r/debian-12/R-${R_VERSION}-debian-12.tar.gz"
 
-      - name: Smoke-test the DEB inside clean Debian 12
+      - name: Smoke-test Debian 12, OpenBLAS and Rcpp source compilation
         shell: bash
         run: |
           set -euo pipefail
           docker run --rm \
             --env "R_VERSION=${R_VERSION}" \
+            --env 'DEBIAN_FRONTEND=noninteractive' \
             --volume "$GITHUB_WORKSPACE/dist/debian-12:/packages:ro" \
-            debian:bookworm \
+            --volume "$GITHUB_WORKSPACE/dist:/report" \
+            "$BASE_IMAGE_DIGEST" \
             bash -euc '
-              export DEBIAN_FRONTEND=noninteractive
               apt-get update -qq
               apt-get install -y --no-install-recommends \
                 "/packages/r-${R_VERSION}_1_amd64.deb"
@@ -125,72 +190,70 @@ jobs:
                 stopifnot(max(abs(crossprod(x) - t(x) %*% x)) < 1e-8)
               '\''
               test -s "/opt/R/${R_VERSION}/lib/R/lib/libR.so"
-              echo "R BLAS/LAPACK configuration:"
-              BLAS_FLAGS="$($R_BIN CMD config BLAS_LIBS)"
-              LAPACK_FLAGS="$($R_BIN CMD config LAPACK_LIBS)"
-              printf "BLAS_LIBS=%s\nLAPACK_LIBS=%s\n" "$BLAS_FLAGS" "$LAPACK_FLAGS"
-              test "$BLAS_FLAGS" = "-lblas"
-              test "$LAPACK_FLAGS" = "-llapack"
-              echo "Generic Debian BLAS/LAPACK alternatives:"
-              readlink -f /usr/lib/x86_64-linux-gnu/libblas.so.3
-              readlink -f /usr/lib/x86_64-linux-gnu/liblapack.so.3
+              BLAS_FLAGS="$("$R_BIN" CMD config BLAS_LIBS)"
+              LAPACK_FLAGS="$("$R_BIN" CMD config LAPACK_LIBS)"
+              test "$BLAS_FLAGS" = -lblas
+              test "$LAPACK_FLAGS" = -llapack
+              echo "BLAS_LIBS=$BLAS_FLAGS ; LAPACK_LIBS=$LAPACK_FLAGS"
               readlink -f /usr/lib/x86_64-linux-gnu/libblas.so.3 | grep -qi openblas
               readlink -f /usr/lib/x86_64-linux-gnu/liblapack.so.3 | grep -qi openblas
-              echo "BLAS dynamic linkage (informational):"
-              ldd "/opt/R/${R_VERSION}/lib/R/lib/libR.so" | grep -Ei "blas|lapack" || true
-              echo "Debian 12 native R, generic BLAS linkage, and OpenBLAS smoke tests passed."
-            '
+              echo "OpenBLAS / alternatives smoke test: PASS"
+              # A real C++ extension compilation and execution, not just CXX flags.
+              # Use an isolated library. Never touch existing single-cell libraries.
+              "$RSCRIPT" --vanilla -e '\''
+                lib <- "/tmp/ci-rcpp-library"
+                dir.create(lib, recursive = TRUE)
+                install.packages("Rcpp", lib = lib,
+                                 repos = "https://cloud.r-project.org",
+                                 type = "source", quiet = TRUE)
+                 .libPaths(c(lib, .libPaths()))
+                stopifnot(requireNamespace("Rcpp", quietly = TRUE))
+                stopifnot(identical(as.integer(Rcpp::evalCpp("2 + 2")), 4L))
+                version <- as.character(packageVersion("Rcpp", lib.loc = lib))
+                writeLines(version, "/report/rcpp-smoke-version.txt")
+                cat("Rcpp source compilation and evalCpp: PASS; version", version, "\n")
+              '\''
+            ' 2>&1 | tee dist/TEST-REPORT.txt
+          test -s dist/rcpp-smoke-version.txt
+          grep -q 'Rcpp source compilation and evalCpp: PASS' dist/TEST-REPORT.txt
 
-      - name: Prepare hashes and build metadata
+      - name: Generate manifest and checksums
         shell: bash
+        env:
+          POSIT_REF_REQUESTED: ${{ inputs.posit_ref }}
+          DEBIAN_BASE_REF_REQUESTED: ${{ inputs.debian_base_ref }}
         run: |
           set -euo pipefail
+          python3 .github/scripts/write_manifest.py --dist dist
           (
             cd dist
-            sha256sum \
-              "debian-12/r-${R_VERSION}_1_amd64.deb" \
-              "r/debian-12/R-${R_VERSION}-debian-12.tar.gz" \
-              > SHA256SUMS
-            {
-              echo "R version: $R_VERSION"
-              echo "OS: Debian 12 (bookworm)"
-              echo "Architecture: amd64"
-              echo "Build strategy: upstream Posit r-builds/build.sh + community Debian 12 packaging"
-              echo "Upstream commit: $(cat posit-upstream-commit.txt)"
-              echo "Built at (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            } > BUILD-INFO.txt
+            find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+            sha256sum --check --strict SHA256SUMS
           )
-          cat dist/SHA256SUMS
-          cat dist/BUILD-INFO.txt
+          echo "## Verified artifact" >> "$GITHUB_STEP_SUMMARY"
+          echo "R: $R_VERSION" >> "$GITHUB_STEP_SUMMARY"
+          echo "Posit SHA: $(cat dist/posit-upstream-commit.txt)" >> "$GITHUB_STEP_SUMMARY"
+          echo 'Rcpp source compilation: PASS' >> "$GITHUB_STEP_SUMMARY"
+          echo 'No release was created. Run **Publish verified R artifact** manually.' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload verified build artifact
-        uses: actions/upload-artifact@v4
+        id: artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: r-${{ steps.resolve_r.outputs.r_version }}-debian12-amd64
-          path: |
-            dist/debian-12/*.deb
-            dist/r/debian-12/*.tar.gz
-            dist/SHA256SUMS
-            dist/BUILD-INFO.txt
-            dist/posit-upstream-commit.txt
+          name: r-${{ steps.resolve.outputs.r_version }}-debian12-amd64
+          path: dist/
           if-no-files-found: error
           retention-days: 30
+          compression-level: 6
 
-      - name: Publish GitHub Release (optional)
-        if: ${{ inputs.publish_release }}
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: r-${{ steps.resolve_r.outputs.r_version }}-debian12-b1
-          name: R ${{ steps.resolve_r.outputs.r_version }} / Debian 12 / amd64 (community build)
-          body: |
-            Unofficial Debian 12 native R build using upstream Posit r-builds scripts.
-            NOT an official Posit binary. CI checks installation, -lblas/-llapack linkage, and OpenBLAS in a clean Debian 12 container.
-            The install prefix is /opt/R/${{ steps.resolve_r.outputs.r_version }}.
-            See BUILD-INFO.txt and SHA256SUMS for build provenance and checksums.
-          files: |
-            dist/debian-12/*.deb
-            dist/r/debian-12/*.tar.gz
-            dist/SHA256SUMS
-            dist/BUILD-INFO.txt
-            dist/posit-upstream-commit.txt
-          fail_on_unmatched_files: true
+      - name: Record artifact ID and digest
+        shell: bash
+        env:
+          ARTIFACT_ID: ${{ steps.artifact.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.artifact.outputs.artifact-digest }}
+        run: |
+          {
+            echo "GitHub Actions run ID: $GITHUB_RUN_ID"
+            echo "Artifact ID: $ARTIFACT_ID"
+            echo "Artifact archive digest: $ARTIFACT_DIGEST"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,162 @@
+name: Publish verified R artifact (manual only)
+
+# No compilation. Promotes an existing successful build artifact as-is.
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: 'Successful Build Posit-style R for Debian 12 Actions run ID'
+        required: true
+        type: string
+      draft_release:
+        description: 'Create a draft Release for one more human review (recommended)'
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: r-debian12-publish-${{ inputs.build_run_id }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Verify artifact from run ${{ inputs.build_run_id }} and publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RUN_ID: ${{ inputs.build_run_id }}
+      DRAFT_RELEASE: ${{ inputs.draft_release }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout repository containing verification code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Validate source run and locate its artifact
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RUN_ID" =~ ^[1-9][0-9]*$ ]] || {
+            echo 'build_run_id must be a positive numeric run ID' >&2; exit 1;
+          }
+          expected_id="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/build-r-debian12.yml" --jq '.id')"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" > /tmp/build-run.json
+          jq -e --argjson wf "$expected_id" --arg repo "$GITHUB_REPOSITORY" '
+            .workflow_id == $wf and .event == "workflow_dispatch" and
+            .status == "completed" and .conclusion == "success" and
+            .head_repository.full_name == $repo and
+            (.head_sha | test("^[a-f0-9]{40}$"))
+          ' /tmp/build-run.json >/dev/null || {
+            echo 'Refusing promotion: run is not a successful manual build in this repository' >&2
+            exit 1
+          }
+          run_sha="$(jq -r .head_sha /tmp/build-run.json)"
+          run_attempt="$(jq -r .run_attempt /tmp/build-run.json)"
+          echo "run_sha=$run_sha" >> "$GITHUB_OUTPUT"
+          echo "run_attempt=$run_attempt" >> "$GITHUB_OUTPUT"
+
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" \
+            > /tmp/build-artifacts.json
+          mapfile -t names < <(jq -r '
+            .artifacts[] |
+            select(.expired == false) |
+            .name |
+            select(test("^r-[0-9]+\\.[0-9]+\\.[0-9]+-debian12-amd64$"))
+          ' /tmp/build-artifacts.json)
+          if [[ ${#names[@]} -ne 1 ]]; then
+            echo "Expected exactly one non-expired R build artifact; found ${#names[@]}" >&2
+            echo 'Artifact may have expired (30-day retention); rebuild manually if so.' >&2
+            exit 1
+          fi
+          echo "artifact_name=${names[0]}" >> "$GITHUB_OUTPUT"
+          echo "Verified successful build run: $RUN_ID ($run_sha), artifact ${names[0]}"
+
+      - name: Download the exact artifact from the successful run
+        shell: bash
+        env:
+          ARTIFACT_NAME: ${{ steps.source.outputs.artifact_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p staged
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "$ARTIFACT_NAME" --dir staged
+          if find staged -type l | grep -q .; then
+            echo 'Refusing promotion: artifact contains symlink(s)' >&2
+            exit 1
+          fi
+          (cd staged && sha256sum --check --strict SHA256SUMS)
+
+      - name: Cross-check manifest against GitHub run and artifact checksums
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ steps.source.outputs.run_sha }}
+          EXPECTED_ATTEMPT: ${{ steps.source.outputs.run_attempt }}
+          ARTIFACT_NAME: ${{ steps.source.outputs.artifact_name }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify_artifact.py --dir staged \
+            --repo "$GITHUB_REPOSITORY" \
+            --run-id "$RUN_ID" \
+            --run-attempt "$EXPECTED_ATTEMPT" \
+            --source-commit "$EXPECTED_SHA" \
+            --artifact-name "$ARTIFACT_NAME"
+
+      - name: Promote as a Release without rebuilding
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.run_sha }}
+        run: |
+          set -euo pipefail
+          version="$(jq -r .target.r_version staged/BUILD-MANIFEST.json)"
+          tag="r-${version}-debian12-run${RUN_ID}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release tag already exists: $tag" >&2; exit 1
+          fi
+          {
+            echo "Unofficial Debian 12 amd64 GNU R ${version}, built using upstream Posit r-builds."
+            echo
+            echo "Promoted (no rebuild) from successful manual Actions run:"
+            echo "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}"
+            echo
+            echo "Posit upstream commit: $(jq -r .provenance.posit_commit staged/BUILD-MANIFEST.json)"
+            echo "Debian base digest: $(jq -r .provenance.debian_base_image staged/BUILD-MANIFEST.json)"
+            echo 'CI checks: native Debian 12 DEB install, Cairo, OpenBLAS alternatives, and Rcpp source compilation + execution.'
+            echo 'Does not certify full Seurat/Bioconductor compatibility or installed oneMKL configurations.'
+            echo
+            echo 'See BUILD-MANIFEST.json, BUILD-ENVIRONMENT.txt, TEST-REPORT.txt and SHA256SUMS.'
+          } > /tmp/release-notes.md
+          draft_opts=()
+          if [[ "$DRAFT_RELEASE" == true ]]; then
+            draft_opts+=(--draft)
+          fi
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SOURCE_SHA" \
+            --title "R ${version} / Debian 12 / amd64 (unofficial build; run ${RUN_ID})" \
+            --notes-file /tmp/release-notes.md \
+            --latest=false \
+            "${draft_opts[@]}" \
+            staged/debian-12/*.deb \
+            staged/r/debian-12/*.tar.gz \
+            staged/SHA256SUMS \
+            staged/BUILD-INFO.txt \
+            staged/BUILD-MANIFEST.json \
+            staged/BUILD-ENVIRONMENT.txt \
+            staged/TEST-REPORT.txt \
+            staged/posit-upstream-commit.txt \
+            staged/debian-base-image.txt \
+            staged/r-source-reference-sha256.txt \
+            staged/rcpp-smoke-version.txt \
+            staged/local-build-files-sha256.txt \
+            staged/builder-image-id.txt
+          {
+            echo "## Promoted existing verified artifact"
+            echo "- Source build: https://github.com/$GITHUB_REPOSITORY/actions/runs/$RUN_ID"
+            echo "- Release tag: $tag"
+            echo "- Draft: $DRAFT_RELEASE"
+            echo '- Recompilation: **none**'
+          } >> "$GITHUB_STEP_SUMMARY"
